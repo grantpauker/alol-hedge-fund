@@ -1,21 +1,22 @@
 #!/usr/bin/env python
 import telegram
+from telegram import replymarkup
 from telegram.ext import (
     CallbackContext,
     CommandHandler,
     PollHandler,
-    PollAnswerHandler,
     Updater,
     MessageHandler,
     ConversationHandler,
     Filters,
 )
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.utils.types import HandlerArg
 import re
-import yfinance as yf
 
-# gme = yf.Ticker("GME")
 import logging
+from enum import IntEnum
+import math
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -23,77 +24,185 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+cancel_keyboard = ReplyKeyboardMarkup(
+    [["Cancel"]],
+    one_time_keyboard=True,
+    selective=True,
+    resize_keyboard=True,
+)
+time_in_force_keyboard = ReplyKeyboardMarkup(
+    [["DAY", "GTC", "FOK", "IOC", "OPG", "CLS"], ["Cancel"]],
+    one_time_keyboard=True,
+    selective=True,
+    resize_keyboard=True,
+)
 
-valid_ticker = re.compile("^\$[A-Z]*$")
-valid_amount = re.compile("^[0-9]*$")
+
+class BuyState(IntEnum):
+    SYMBOL = 0
+    ORDER_TYPE = 1
+    TIME_IN_FORCE = 2
+    CASH = 3
+    LIMIT = 4
+    STOP = 5
 
 
-TICKER, AMOUNT, POLL, ORDER = range(4)
+class Order:
+    def __init__(
+        self,
+        symbol=None,
+        order_type=None,
+        time_in_force=None,
+        cash=None,
+        limit=None,
+        stop=None,
+    ):
+        self.symbol = symbol
+        self.order_type = order_type
+        self.time_in_force = time_in_force
+        self.cash = cash
+        self.limit = limit
+        self.stop = stop
 
-open_poll: telegram.message.Message = None
+    def __str__(self):
+        return f"{self.symbol}, {self.order_type}, {self.time_in_force}, {self.cash}, ({self.limit}, {self.stop})"
 
 
-def onBuy(update: telegram.Update, context: CallbackContext) -> int:
+class OrderPoll:
+    def __init__(self, poll: telegram.Message = None, user: telegram.User = None):
+        self.poll = poll
+        self.user = user
+
+
+open_order = Order()
+open_poll = OrderPoll()
+vote_majority = 0.5
+DEBUG = True
+
+
+def startBuy(update: telegram.Update, context: CallbackContext) -> BuyState:
+    update.message.reply_text("Ticker symbol?", reply_markup=cancel_keyboard)
+    return BuyState.SYMBOL
+
+
+def parseSymbol(update: telegram.Update, context: CallbackContext) -> BuyState:
+    open_order.symbol = update.message.text
+    # TODO implement stop limit order
     update.message.reply_text(
-        "What would you like to buy? Please send a ticker symbol (ex: $APPL, $TSLA, $GME)"
+        f"{open_order.symbol}. Order type?",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Market", "Limit", "Stop"], ["Cancel"]],
+            one_time_keyboard=True,
+            selective=True,
+            resize_keyboard=True,
+        ),
+    )
+    return BuyState.ORDER_TYPE
+
+
+def parseOrderType(update: telegram.Update, context: CallbackContext) -> BuyState:
+    open_order.order_type = update.message.text
+    update.message.reply_text(
+        f"{open_order.order_type}. Time in force?", reply_markup=time_in_force_keyboard
     )
 
-    return TICKER
+    return BuyState.TIME_IN_FORCE
 
 
-def onTicker(update: telegram.Update, context: CallbackContext) -> int:
-    text = update.message.text
-    if valid_ticker.match(text) is not None:
-        for e in update.message.entities:
-            if e.type == "cashtag":
-                start = e.offset
-                end = start + e.length
-                ticker = update.message.text[start:end]
-                update.message.reply_text(
-                    f"You requested {ticker}. How much do you want to buy?"
-                )
-                return AMOUNT
-    update.message.reply_text("Please send a valid ticker symbol")
-    return TICKER
+def parseOrderTypeLimit(update: telegram.Update, context: CallbackContext) -> BuyState:
+    open_order.order_type = update.message.text
+    update.message.reply_text(
+        f"{open_order.order_type}. Limit price?", reply_markup=cancel_keyboard
+    )
+    return BuyState.LIMIT
 
 
-def onAmount(update: telegram.Update, context: CallbackContext) -> int:
+def parseLimit(update: telegram.Update, context: CallbackContext) -> BuyState:
+    open_order.limit = update.message.text
+    update.message.reply_text(
+        f"{open_order.limit}. Time in force?", reply_markup=time_in_force_keyboard
+    )
+    return BuyState.TIME_IN_FORCE
+
+
+def parseOrderTypeStop(update: telegram.Update, context: CallbackContext) -> BuyState:
+    open_order.order_type = update.message.text
+    update.message.reply_text(
+        f"{open_order.order_type}. Stop price?", reply_markup=cancel_keyboard
+    )
+    return BuyState.STOP
+
+
+def parseStop(update: telegram.Update, context: CallbackContext) -> BuyState:
+    open_order.stop = update.message.text
+    update.message.reply_text(
+        f"{open_order.stop}. Time in force?", reply_markup=time_in_force_keyboard
+    )
+
+    return BuyState.TIME_IN_FORCE
+
+
+def parseTimeInForce(update: telegram.Update, context: CallbackContext) -> BuyState:
+    open_order.time_in_force = update.message.text
+    update.message.reply_text(
+        f"{open_order.time_in_force}. Cash?", reply_markup=cancel_keyboard
+    )
+    return BuyState.CASH
+
+
+def parseCash(update: telegram.Update, context: CallbackContext) -> BuyState:
     global open_poll
-    text = update.message.text
-    if valid_amount.match(text) is not None:
-        update.message.reply_text(f"You want to buy {update.message.text}")
-        poll = update.message.reply_poll(f"Vote?", ["Yes", "No"], False)
-        open_poll = poll
-        return ConversationHandler.END
-    update.message.reply_text("Please send a valid amount")
-    return AMOUNT
+    open_order.cash = update.message.text
+    logger.info(open_order)
+    open_poll.poll = update.message.reply_poll(
+        f"Buy {open_order.cash} of {open_order.symbol} in a {open_order.order_type}, {open_order.time_in_force} order?",
+        ["Yes", "No"],
+        False,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    open_poll.user = update.message.from_user
+    return ConversationHandler.END
 
 
-def onPoll(update: HandlerArg, context: CallbackContext):
+def onPollUpdate(update: HandlerArg, context: CallbackContext):
     global open_poll
-    if update.poll == None or open_poll == None:
-        return
     yes_count = -1
-    if update.poll.id == open_poll.poll.id:
+    if (open_poll.poll is not None) and update.poll == open_poll.poll.poll:
         for opt in update.poll.options:
             if opt.text == "Yes":
                 yes_count = opt.voter_count
-                logger.info(yes_count)
-    if yes_count >= 1:
-        open_poll.reply_text("Purchased")
-        open_poll = None
-        return ConversationHandler.END
+    if yes_count == -1:
+        return
+
+    needed_count = math.ceil(open_poll.poll.chat.get_members_count() * vote_majority)
+    if DEBUG:
+        needed_count = 1
+
+    if yes_count >= needed_count:
+        open_poll.poll.reply_text("Purchased.")
+        open_poll = OrderPoll()
 
 
-def onHoldings(update: HandlerArg, context: CallbackContext):    
-    update.message.reply_text(
-        "You have 69 in $DEEZNUTS. Current value is (INSERT YAHOO STUFF)"
-    )
-
-
-def cancel(update: telegram.Update, context: CallbackContext) -> int:
-    update.message.reply_text("CANCELED")
+def cancelBuy(update: telegram.Update, context: CallbackContext) -> int:
+    update.message.reply_text("Canceled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+
+def cancelPoll(update: telegram.Update, context: CallbackContext):
+    global open_poll
+    reply = update.message.reply_to_message
+    if (reply is not None) and (reply.poll is not None) and (reply == open_poll.poll):
+        if update.message.from_user == open_poll.user:
+            update.message.reply_text("Cancelling poll.")
+            open_poll = OrderPoll()
+        else:
+            update.message.reply_text(
+                f"Only @{open_poll.user.username} can cancel this poll."
+            )
+
+
+def testHandler(update: telegram.Update, context: CallbackContext):
+    logger.info(update.effective_chat.get_members_count())
 
 
 def main():
@@ -101,22 +210,48 @@ def main():
         token = token_file.read().rstrip("\n")
         updater = Updater(token, use_context=True)
 
-    updater.dispatcher.add_handler(CommandHandler("holdings", onHoldings))
-    updater.dispatcher.add_handler(PollHandler(onPoll))
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("buy", onBuy)],
+    dp = updater.dispatcher
+
+    buy_conversation = ConversationHandler(
+        entry_points=[CommandHandler("buy", startBuy)],
         states={
-            TICKER: [
-                MessageHandler(Filters.text, onTicker),
+            BuyState.SYMBOL: [
+                MessageHandler(Filters.regex("^(Cancel)$"), cancelBuy),
+                MessageHandler(Filters.regex("^\$[A-Z]*$"), parseSymbol),
             ],
-            AMOUNT: [
-                MessageHandler(Filters.text, onAmount),
+            BuyState.ORDER_TYPE: [
+                MessageHandler(Filters.regex("^(Cancel)$"), cancelBuy),
+                MessageHandler(Filters.regex("^(Market|Stop Limit)$"), parseOrderType),
+                MessageHandler(Filters.regex("^Limit$"), parseOrderTypeLimit),
+                MessageHandler(Filters.regex("^Stop$"), parseOrderTypeStop),
+            ],
+            BuyState.LIMIT: [
+                MessageHandler(Filters.regex("^(Cancel)$"), cancelBuy),
+                MessageHandler(Filters.regex("^\$?[0-9]*(\.[0-9]*)?$"), parseLimit),
+            ],
+            BuyState.STOP: [
+                MessageHandler(Filters.regex("^(Cancel)$"), cancelBuy),
+                MessageHandler(Filters.regex("^\$?[0-9]*(\.[0-9]*)?$"), parseStop),
+            ],
+            BuyState.TIME_IN_FORCE: [
+                MessageHandler(Filters.regex("^(Cancel)$"), cancelBuy),
+                MessageHandler(
+                    Filters.regex("^(DAY|GTC|FOK|IOC|OPG|CLS)$"), parseTimeInForce
+                ),
+            ],
+            BuyState.CASH: [
+                MessageHandler(Filters.regex("^(Cancel)$"), cancelBuy),
+                MessageHandler(Filters.regex("^\$?[0-9]*(\.[0-9]*)?$"), parseCash),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancelBuy)],
     )
+    dp.add_handler(buy_conversation)
 
-    updater.dispatcher.add_handler(conv_handler)
+    dp.add_handler(PollHandler(onPollUpdate))
+    dp.add_handler(CommandHandler("cancel", cancelPoll))
+    dp.add_handler(CommandHandler("test", testHandler))
+
     updater.start_polling()
     updater.idle()
 
